@@ -236,34 +236,37 @@ def main():
             # ── render ────────────────────────────────────────────────────
             if current_frame is not None:
                 contour_count = None
+                detections = [] 
+                display_frame_video = current_frame.copy()
 
                 if viewing_zoomed and roi_params and back_sub:
-                    vis, detections = process_frame_for_contours(
+                    # 1. Detect contours in the ROI
+                    vis_roi, detections = process_frame_for_contours(
                         current_frame, roi_params, back_sub,
                         kernel_open, kernel_close,
                         update_bg=(not paused),
                     )
                     contour_count = len(detections)
-                    video_frame   = vis
+                    
+                    # 2. Unpack coordinates
+                    rx, ry, rw, rh = roi_params
+                    
+                    # 3. Paste the processed ROI back onto the FULL frame
+                    display_frame_video[ry:ry + rh, rx:rx + rw] = vis_roi
+                    
+                    # 4. Draw the border (This is where Line 255 should be moved to)
+                    cv2.rectangle(display_frame_video, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 1)
 
-                    if display_zoom != 1.0:
-                        h, w = video_frame.shape[:2]
-                        video_frame = cv2.resize(
-                            video_frame,
-                            (int(w * display_zoom), int(h * display_zoom)),
-                            interpolation=cv2.INTER_NEAREST,
-                        )
-                else:
-                    video_frame = current_frame.copy()
 
-                h, w    = video_frame.shape[:2]
-                status  = "PAUSED" if paused else "PLAYING"
+                # Now create the info bar based on the FULL frame width
+                h, w = display_frame_video.shape[:2]
+                status = "PAUSED" if paused else "PLAYING"
                 info_bar = create_info_bar(
                     w, status, frame_count, total_frames, speed_multiplier,
                     contour_count=contour_count,
-                    zoom=display_zoom if viewing_zoomed else None,
-                )
-                display_frame = np.vstack([info_bar, video_frame])
+                    zoom=None # Zoom is now gone!
+    )
+                display_frame = np.vstack([info_bar, display_frame_video])
 
                 # ROI selection overlay
                 if roi_selecting:
