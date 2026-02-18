@@ -22,7 +22,7 @@ tuning_mode    = False
 display_zoom   = 2.0
 INFO_BAR_HEIGHT = 100
 
-
+     
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def circularity(area: float, perimeter: float) -> float:
