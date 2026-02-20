@@ -1,0 +1,290 @@
+========================================================================
+AQUAVISION — REAL-TIME VIDEO VIEWER
+Steps 2–5: ROI Selection → Background Subtraction → Contour Detection
+           → Shape & Intensity Feature Extraction
+========================================================================
+
+USAGE
+------------------------------------------------------------------------
+  python MainCode.py <video_path>
+
+  Example:
+    python MainCode.py TestVideo.mp4
+
+
+========================================================================
+KEYBOARD COMMANDS
+========================================================================
+
+  GENERAL
+  -------
+  SPACE         Pause / unpause playback
+  q             Quit the program and print final parameters to console
+  s             Save the current displayed frame as a PNG file
+                  Output filename: frame_XXXXXX.png
+
+  PLAYBACK SPEED
+  --------------
+  + or =        Increase playback speed by 0.25x (max 8.00x)
+  -             Decrease playback speed by 0.25x (min 0.05x)
+                  Speed is shown in the info bar at the top of the window.
+                  Does not affect frame stepping — only live playback.
+
+  DISPLAY ZOOM
+  ------------
+  ]             Zoom in  (+0.5x per press, max 8.0x)
+  [             Zoom out (-0.5x per press, min 1.0x)
+                  Zoom applies only to the ROI detection view, not the
+                  full-frame view. Uses nearest-neighbor interpolation
+                  to keep pixel edges sharp.
+
+  ROI SELECTION
+  -------------
+  r             Toggle ROI selection mode on/off
+                  - Pauses playback automatically when activated
+                  - Click and drag on the video to draw a rectangle
+                  - Release mouse to confirm the ROI
+                  - Press r again before releasing to cancel
+                  Once confirmed, the script:
+                    1. Creates a fresh MOG2 background model
+                    2. Trains it on the last 100 frames in history
+                    3. Switches the view to the cropped ROI with
+                       contour detection and feature overlays active
+
+  FRAME STEPPING  (only works while paused)
+  -------------
+  a             Step one frame backward
+  d             Step one frame forward
+  Left arrow    Step one frame backward  (platform-dependent keycode)
+  Right arrow   Step one frame forward   (platform-dependent keycode)
+
+  TUNING MODE
+  -----------
+  t             Toggle tuning mode on/off
+                  Tuning mode lets you adjust contour filter parameters
+                  live without restarting. Changes take effect immediately
+                  on the next frame rendered.
+
+  Inside tuning mode:
+  1             Decrease min_area by 10 px²  (floor: 10)
+  2             Increase min_area by 10 px²
+  3             Decrease max_area by 100 px² (floor: 100)
+  4             Increase max_area by 100 px²
+  5             Decrease min_circularity by 0.05 (floor: 0.00)
+  6             Increase min_circularity by 0.05 (ceiling: 1.00)
+
+
+========================================================================
+TUNING PARAMETERS — WHERE TO FIND THEM IN THE CODE
+========================================================================
+
+All parameters listed below are hard-coded near the top of the file or
+inside cv2.createBackgroundSubtractorMOG2(). Tune them iteratively in
+the order listed — segmentation first, filtering second, features last.
+
+
+------------------------------------------------------------------------
+1. BACKGROUND SUBTRACTION (MOG2)
+   Location: roi_complete block in main(), ~line 390
+------------------------------------------------------------------------
+
+  history (default: 500)
+    Number of past frames MOG2 uses to build its background model.
+    Higher = more stable model but slower to adapt to genuine background
+    changes. For a static camera, 500 is appropriate.
+
+  varThreshold (default: 20)
+    Squared Mahalanobis distance threshold. A pixel is classified as
+    foreground only if its intensity deviates from the background model
+    by more than this value.
+      Low  (4–16)  : Detects faint movement; prone to false positives
+      Medium (20–40): Good starting range for drip flow footage
+      High (50–100) : Only detects high-contrast objects; may miss dim
+                      droplets
+    Raise this if background flicker or noise creates false contours.
+    Lower it if real droplets are being missed.
+
+  detectShadows (default: False)
+    When True, MOG2 marks shadow pixels separately (gray in mask).
+    Set to False for drip flow — shadow detection adds overhead and
+    is not needed here.
+
+  update_bg (passed to process_frame_for_contours)
+    Currently hard-coded to False in the render call.
+    False = background model is frozen after initial training.
+            Recommended for drip flow — prevents MOG2 from absorbing
+            droplets into the background after the first pass.
+    0.001 = very slow live adaptation, useful if lighting drifts
+            over a long recording session.
+
+
+------------------------------------------------------------------------
+2. MORPHOLOGY KERNELS
+   Location: main(), ~line 400
+------------------------------------------------------------------------
+
+  kernel_open  — cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    Applied first via MORPH_OPEN (erode then dilate).
+    Removes isolated speckle noise smaller than the kernel from the
+    foreground mask. Blobs smaller than the kernel are erased entirely.
+      Increase to (5,5) or (7,7) if noise survives into the contour
+      stage.
+      Do not exceed the diameter of your smallest real droplet or those
+      droplets will be erased too.
+
+  kernel_close — cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    Applied second via MORPH_CLOSE (dilate then erode).
+    Fills small internal holes and gaps inside blobs. Critical for
+    bubbles, which often appear as hollow rings in the foreground mask
+    because their interior intensity is close to background.
+      Increase to (7,7) or (9,9) if bubbles appear fragmented or
+      ring-shaped in the mask.
+      Too large risks merging two adjacent droplets into one contour.
+
+
+------------------------------------------------------------------------
+3. CONTOUR FILTERS (ContourParams class)
+   Location: top of file, ~line 20
+   Also adjustable live via tuning mode (t key)
+------------------------------------------------------------------------
+
+  min_area (default: 50 px²)
+    Minimum contour area in pixels squared. Contours smaller than this
+    are discarded. Set just above the largest noise blob you observe
+    in the foreground mask.
+
+  max_area (default: 5000 px²)
+    Maximum contour area in pixels squared. Contours larger than this
+    are discarded. Set just above the largest real droplet or bubble
+    you expect to see.
+
+  min_circularity (default: 0.3)
+    Minimum value of 4πA/P² (ranges 0 to 1). Filters out elongated
+    or jagged shapes.
+      1.0  = perfect circle
+      0.7+ = near-circular (sessile bubbles)
+      0.4–0.6 = elongated (droplets mid-fall)
+      0.3  = broad starting value; raise once area filters are clean
+    Do not raise above 0.5 until you have confirmed the shapes of your
+    real detections using the overlay.
+
+  max_circularity (default: 1.0)
+    Upper bound. Leave at 1.0 unless you specifically want to exclude
+    near-perfect circles.
+
+
+------------------------------------------------------------------------
+4. RIM SCORE FEATURE (bubble vs droplet cue)
+   Location: top of file, ~line 30 (thickness) and
+             process_frame_for_contours overlay block (threshold)
+------------------------------------------------------------------------
+
+  RIM_THICKNESS_PX (default: 3)
+    Controls how wide the annular rim band is when sampling intensity.
+    The filled contour mask is eroded by this many pixels to produce
+    an interior mask. The rim band = filled mask minus interior mask.
+    Rule of thumb: set to ~10–15% of your smallest droplet diameter
+    in pixels.
+      Too small (1–2): rim band has very few pixels; score is noisy
+      Too large      : rim band eats into interior; score trends to
+                       zero for everything; blobs smaller than the
+                       kernel fall back to rim_score = 0.0
+
+  rim_score threshold (default: 15)
+    Located in the overlay drawing block inside
+    process_frame_for_contours:
+      cnt_color = (0,255,255) if abs(d["rim_score"]) > 15 else (0,255,0)
+    Controls the visual boundary between bubble (yellow) and droplet
+    (green) contours on the overlay. This is not a classification
+    decision — it is a visual indicator only.
+    To calibrate: step through frames with a/d, observe the
+    rim= values printed on objects you can visually identify, and
+    set the threshold in the gap between the two populations.
+
+
+========================================================================
+OVERLAY LABELS (displayed on each detected contour)
+========================================================================
+
+  Contour color
+    Yellow  |rim_score| > threshold  →  likely bubble candidate
+    Green   |rim_score| ≤ threshold  →  likely droplet candidate
+
+  Red dot       Centroid of the contour
+
+  Line 1 (yellow text):
+    A=XXXpx2    Contour area in pixels squared (from cv2.contourArea)
+    c=0.XX      Circularity (4πA/P², range 0–1)
+
+  Line 2 (purple text):
+    rim=+X.X    Rim score = mean(rim pixels) − mean(interior pixels)
+                  Positive → bright rim, dark center (classic bubble)
+                  Negative → dark rim, bright center
+                  Near zero → uniform fill (droplet)
+    I=XXX       Mean grayscale intensity (0–255) of all pixels inside
+                the contour, sampled from the original frame
+
+
+========================================================================
+INFO BAR (top of window)
+========================================================================
+
+  Left side:
+    PLAYING / PAUSED   Current playback state (green / orange)
+    Frame: X/Y         Current frame number out of total frames
+
+  Middle:
+    Speed: X.XXx       Current playback speed multiplier
+    +/- to change      Reminder of speed keys
+
+  Right side (visible after ROI is active):
+    Contours: X        Number of contours passing all filters this frame
+    Area: X-Xpx        Current min_area / max_area filter values
+    Circ: X.XX-X.XX    Current min/max circularity filter values
+    Zoom: X.Xx         Current display zoom (shown only if zoom > 1.0x)
+
+
+========================================================================
+SESSION END OUTPUT
+========================================================================
+
+  When you press q to quit, the console prints the final values of all
+  tuned parameters formatted as a ready-to-paste Python class:
+
+    class ContourParams:
+        min_area        = <value>
+        max_area        = <value>
+        min_circularity = <value>
+        max_circularity = <value>
+
+    RIM_THICKNESS_PX = <value>
+
+  Copy these into the top of the script to hard-code your tuned values
+  before moving on to Step 6 (tracking) and Step 7 (classification).
+
+
+========================================================================
+RECOMMENDED TUNING ORDER
+========================================================================
+
+  1. Play video unpaused at low speed → watch for gross false positives
+       Fix: raise varThreshold, increase kernel_open size
+
+  2. Pause and step frame by frame (a/d) → check foreground mask quality
+       Add cv2.imshow("FG Mask", fg_cleaned) temporarily to diagnose
+       whether mask is empty (MOG2 issue) or blobs exist but are
+       filtered out (ContourParams issue)
+
+  3. Use tuning mode (t) to set min_area just above noise blob size
+       and max_area just above largest real object
+
+  4. Check for hollow/fragmented masks on bubbles
+       Fix: increase kernel_close size
+
+  5. Observe rim= values on known bubbles and droplets
+       Set RIM_THICKNESS_PX to ~10–15% of smallest droplet diameter
+       Set rim_score threshold to split the two populations
+
+  6. Record final values — printed automatically on quit (q)
+
+========================================================================
