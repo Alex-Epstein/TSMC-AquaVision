@@ -1,13 +1,19 @@
+"""
+Real-Time Video Viewer — Steps 2–5
+ROI selection → MOG2 background subtraction → findContours →
+shape + intensity + rim-score features per detection
+"""
+
 import cv2
 import sys
 import numpy as np
 
 
-roi_selecting = False
-roi_start     = None
-roi_end       = None
-roi_complete  = False
-roi_params    = None
+roi_selecting   = False
+roi_start       = None
+roi_end         = None
+roi_complete    = False
+roi_params      = None
 
 
 class ContourParams:
@@ -17,19 +23,68 @@ class ContourParams:
     max_circularity = 1.0
 
 
-contour_params = ContourParams()
-tuning_mode    = False
-display_zoom   = 2.0
+contour_params  = ContourParams()
+tuning_mode     = False
+display_zoom    = 2.0
 INFO_BAR_HEIGHT = 100
 
-     
-# ── helpers ──────────────────────────────────────────────────────────────────
+RIM_THICKNESS_PX = 3   # ← tune: ~10-15% of smallest expected droplet diameter
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def circularity(area: float, perimeter: float) -> float:
-    """Returns 4πA/P²; clamps to [0,1] to handle numeric noise."""
+    """4πA/P², clamped to [0, 1]."""
     if perimeter < 1e-6:
         return 0.0
     return min(1.0, (4 * np.pi * area) / (perimeter ** 2))
+
+
+def compute_features(cnt, gray_roi: np.ndarray) -> dict:
+    h, w = gray_roi.shape[:2]
+
+    area  = cv2.contourArea(cnt)
+    perim = cv2.arcLength(cnt, closed=True)
+    circ  = circularity(area, perim)
+    eq_d  = np.sqrt(4 * area / np.pi)
+
+    mask_filled = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(mask_filled, [cnt], -1, 255, thickness=cv2.FILLED)
+
+    mean_val, std_val  = cv2.meanStdDev(gray_roi, mask=mask_filled)
+    mean_intensity     = float(mean_val[0][0])
+    std_intensity      = float(std_val[0][0])
+
+    k = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * RIM_THICKNESS_PX + 1, 2 * RIM_THICKNESS_PX + 1)
+    )
+    mask_interior = cv2.erode(mask_filled, k, iterations=1)
+    mask_rim      = cv2.subtract(mask_filled, mask_interior)
+
+    rim_pixels      = gray_roi[mask_rim      > 0]
+    interior_pixels = gray_roi[mask_interior > 0]
+
+    if rim_pixels.size > 0 and interior_pixels.size > 0:
+        rim_mean      = float(rim_pixels.mean())
+        interior_mean = float(interior_pixels.mean())
+        rim_score     = rim_mean - interior_mean
+    else:
+        rim_mean      = mean_intensity
+        interior_mean = mean_intensity
+        rim_score     = 0.0
+
+    return {
+        "area_px":        area,
+        "perimeter_px":   perim,
+        "eq_diameter_px": eq_d,
+        "circularity":    circ,
+        "mean_intensity": mean_intensity,
+        "std_intensity":  std_intensity,
+        "rim_mean":       rim_mean,
+        "interior_mean":  interior_mean,
+        "rim_score":      rim_score,
+    }
 
 
 def mouse_callback(event, x, y, flags, param):
@@ -61,13 +116,12 @@ def mouse_callback(event, x, y, flags, param):
 
 def create_info_bar(width, status, frame_count, total_frames, speed,
                     contour_count=None, zoom=None):
-    bar        = np.zeros((INFO_BAR_HEIGHT, width, 3), dtype=np.uint8)
-    bar[:]     = (40, 40, 40)
+    bar    = np.zeros((INFO_BAR_HEIGHT, width, 3), dtype=np.uint8)
+    bar[:] = (40, 40, 40)
     cv2.line(bar, (0, 0), (width, 0), (100, 100, 100), 2)
 
     s_col = (0, 200, 0) if status == "PLAYING" else (0, 150, 255)
-    cv2.putText(bar, status,
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, s_col, 2)
+    cv2.putText(bar, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, s_col, 2)
     cv2.putText(bar, f"Frame: {frame_count}/{total_frames}",
                 (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
     cv2.putText(bar, f"Speed: {speed:.2f}x",
@@ -78,11 +132,9 @@ def create_info_bar(width, status, frame_count, total_frames, speed,
     if contour_count is not None:
         cv2.putText(bar, f"Contours: {contour_count}",
                     (450, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        cv2.putText(bar,
-                    f"Area: {contour_params.min_area}-{contour_params.max_area}px",
+        cv2.putText(bar, f"Area: {contour_params.min_area}-{contour_params.max_area}px",
                     (450, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        cv2.putText(bar,
-                    f"Circ: {contour_params.min_circularity:.2f}-{contour_params.max_circularity:.2f}",
+        cv2.putText(bar, f"Circ: {contour_params.min_circularity:.2f}-{contour_params.max_circularity:.2f}",
                     (450, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
     if zoom is not None and zoom != 1.0:
@@ -94,27 +146,22 @@ def create_info_bar(width, status, frame_count, total_frames, speed,
     return bar
 
 
-# ── core detection ────────────────────────────────────────────────────────────
+# ── core detection + feature extraction ──────────────────────────────────────
 
 def process_frame_for_contours(frame, roi_params, back_sub,
                                 kernel_open, kernel_close,
                                 update_bg=True):
-    """
-    Returns (annotated_roi_bgr, list_of_dicts).
-    Each dict: {cx, cy, area, perimeter, circularity, contour}
-    """
     roi_x, roi_y, roi_w, roi_h = roi_params
-    cropped = frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
+    cropped  = frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
+    gray_roi = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
 
-    # ── background subtraction ────────────────────────────────────────────
-    lr = -1 if update_bg else 0
-    fg_raw = back_sub.apply(cropped, learningRate=lr)
+    lr       = 0.001 if update_bg else 0
+    fg_raw   = back_sub.apply(cropped, learningRate=lr)
 
-    _, fg_thresh  = cv2.threshold(fg_raw, 127, 255, cv2.THRESH_BINARY)
-    fg_opened     = cv2.morphologyEx(fg_thresh,  cv2.MORPH_OPEN,  kernel_open)
-    fg_cleaned    = cv2.morphologyEx(fg_opened,  cv2.MORPH_CLOSE, kernel_close)
+    _, fg_thresh = cv2.threshold(fg_raw, 127, 255, cv2.THRESH_BINARY)
+    fg_opened    = cv2.morphologyEx(fg_thresh,  cv2.MORPH_OPEN,  kernel_open)
+    fg_cleaned   = cv2.morphologyEx(fg_opened,  cv2.MORPH_CLOSE, kernel_close)
 
-    # ── contour detection ─────────────────────────────────────────────────
     contours, _ = cv2.findContours(
         fg_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
@@ -130,30 +177,35 @@ def process_frame_for_contours(frame, roi_params, back_sub,
         if not (contour_params.min_circularity <= circ <= contour_params.max_circularity):
             continue
 
-        M  = cv2.moments(cnt)
+        M = cv2.moments(cnt)
         if M["m00"] == 0:
             continue
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
+        feats = compute_features(cnt, gray_roi)
+
         detections.append({
             "cx": cx, "cy": cy,
-            "area": area, "perimeter": perim,
-            "circularity": circ,
             "contour": cnt,
+            **feats,
         })
 
     # ── draw overlay ──────────────────────────────────────────────────────
     vis = cropped.copy()
     for d in detections:
-        cv2.drawContours(vis, [d["contour"]], -1, (0, 255, 0), 2)
+        cnt_color = (0, 255, 255) if abs(d["rim_score"]) > 15 else (0, 255, 0)
+        cv2.drawContours(vis, [d["contour"]], -1, cnt_color, 2)
         cv2.circle(vis, (d["cx"], d["cy"]), 4, (0, 0, 255), -1)
 
-        eq_diam = int(np.sqrt(4 * d["area"] / np.pi))
-        label   = f"d={eq_diam}px c={d['circularity']:.2f}"
-        cv2.putText(vis, label,
-                    (d["cx"] + 6, d["cy"]),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 0), 1)
+        line1 = f"A={int(d['area_px'])}px2 c={d['circularity']:.2f}"   # ← CHANGED
+        line2 = f"rim={d['rim_score']:+.1f} I={d['mean_intensity']:.0f}"
+        cv2.putText(vis, line1,
+                    (d["cx"] + 6, d["cy"] - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 0), 1)
+        cv2.putText(vis, line2,
+                    (d["cx"] + 6, d["cy"] + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 255), 1)
 
     return vis, detections
 
@@ -189,7 +241,7 @@ def main():
     frame_count      = 0
     saved_count      = 0
     viewing_zoomed   = False
-    speed_multiplier = 1.0          # start at 1× — use +/- to change
+    speed_multiplier = 1.0
 
     cv2.namedWindow("Video Viewer")
     cv2.setMouseCallback("Video Viewer", mouse_callback, video_path)
@@ -206,7 +258,6 @@ def main():
 
     try:
         while True:
-            # ── frame acquisition ─────────────────────────────────────────
             if not roi_selecting and not paused:
                 ret, frame = cap.read()
                 if not ret:
@@ -233,42 +284,37 @@ def main():
                         if not frame_history:
                             frame_history.append(frame.copy())
 
-            # ── render ────────────────────────────────────────────────────
             if current_frame is not None:
                 contour_count = None
-                detections = [] 
-                display_frame_video = current_frame.copy()
 
                 if viewing_zoomed and roi_params and back_sub:
-                    # 1. Detect contours in the ROI
-                    vis_roi, detections = process_frame_for_contours(
+                    vis, detections = process_frame_for_contours(
                         current_frame, roi_params, back_sub,
                         kernel_open, kernel_close,
-                        update_bg=(not paused),
+                        update_bg=False,
                     )
                     contour_count = len(detections)
-                    
-                    # 2. Unpack coordinates
-                    rx, ry, rw, rh = roi_params
-                    
-                    # 3. Paste the processed ROI back onto the FULL frame
-                    display_frame_video[ry:ry + rh, rx:rx + rw] = vis_roi
-                    
-                    # 4. Draw the border (This is where Line 255 should be moved to)
-                    cv2.rectangle(display_frame_video, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 1)
+                    video_frame   = vis
 
+                    if display_zoom != 1.0:
+                        h, w = video_frame.shape[:2]
+                        video_frame = cv2.resize(
+                            video_frame,
+                            (int(w * display_zoom), int(h * display_zoom)),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                else:
+                    video_frame = current_frame.copy()
 
-                # Now create the info bar based on the FULL frame width
-                h, w = display_frame_video.shape[:2]
-                status = "PAUSED" if paused else "PLAYING"
+                h, w     = video_frame.shape[:2]
+                status   = "PAUSED" if paused else "PLAYING"
                 info_bar = create_info_bar(
                     w, status, frame_count, total_frames, speed_multiplier,
                     contour_count=contour_count,
-                    zoom=None # Zoom is now gone!
-    )
-                display_frame = np.vstack([info_bar, display_frame_video])
+                    zoom=display_zoom if viewing_zoomed else None,
+                )
+                display_frame = np.vstack([info_bar, video_frame])
 
-                # ROI selection overlay
                 if roi_selecting:
                     dh, dw = display_frame.shape[:2]
                     cv2.rectangle(display_frame,
@@ -291,10 +337,9 @@ def main():
 
                 cv2.imshow("Video Viewer", display_frame)
 
-            # ── activate contour mode once ROI is drawn ───────────────────
             if roi_complete and not viewing_zoomed and roi_params:
                 back_sub = cv2.createBackgroundSubtractorMOG2(
-                    history=500, varThreshold=16, detectShadows=False)
+                    history=500, varThreshold=20, detectShadows=False)
 
                 print("Training background model on recent frames...")
                 roi_x, roi_y, roi_w, roi_h = roi_params
@@ -306,7 +351,6 @@ def main():
                 roi_selecting  = False
                 print("CONTOUR DETECTION ACTIVE\n")
 
-            # ── key handling ──────────────────────────────────────────────
             delay = max(1, int(1000 / fps / speed_multiplier)) if not paused else 1
             key   = cv2.waitKey(delay) & 0xFF
 
@@ -317,8 +361,7 @@ def main():
                 paused = not paused
                 print(f"{'PAUSED' if paused else 'PLAYING'}")
 
-            # speed up / slow down
-            elif key == ord('+') or key == ord('='):   # '=' shares key with '+' (no shift)
+            elif key == ord('+') or key == ord('='):
                 speed_multiplier = min(8.0, round(speed_multiplier + 0.25, 2))
                 print(f"Speed: {speed_multiplier:.2f}x")
 
@@ -352,9 +395,8 @@ def main():
                 else:
                     print(">>> ROI selection cancelled <<<\n")
 
-            # step backward
             elif (key == ord('a') or key in left_arrow_codes) and paused:
-                new_pos = max(0, frame_count - 2)   # -2 because read() advances by 1
+                new_pos = max(0, frame_count - 2)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, new_pos)
                 ret, frame = cap.read()
                 if ret:
@@ -362,7 +404,6 @@ def main():
                     frame_count   = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                     print(f"← Frame: {frame_count}/{total_frames}")
 
-            # step forward
             elif (key == ord('d') or key in right_arrow_codes) and paused:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count)
                 ret, frame = cap.read()
@@ -371,12 +412,11 @@ def main():
                     frame_count   = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                     print(f"→ Frame: {frame_count}/{total_frames}")
 
-            # tuning mode toggle
             elif key == ord('t'):
                 tuning_mode = not tuning_mode
                 if tuning_mode:
                     print("\n" + "=" * 70)
-                    print("TUNING MODE  —  keys: 1/2=MinArea  3/4=MaxArea  5/6=MinCirc  t=Exit")
+                    print("TUNING MODE  —  1/2=MinArea  3/4=MaxArea  5/6=MinCirc  t=Exit")
                     print(f"Current: area {contour_params.min_area}-{contour_params.max_area} | "
                           f"circ {contour_params.min_circularity:.2f}-{contour_params.max_circularity:.2f}")
                     print("=" * 70)
@@ -386,9 +426,9 @@ def main():
             elif tuning_mode:
                 changed = False
                 if key == ord('1'):
-                    contour_params.min_area = max(10, contour_params.min_area - 10);  changed = True
+                    contour_params.min_area = max(10, contour_params.min_area - 10);   changed = True
                 elif key == ord('2'):
-                    contour_params.min_area += 10;                                    changed = True
+                    contour_params.min_area += 10;                                     changed = True
                 elif key == ord('3'):
                     contour_params.max_area = max(100, contour_params.max_area - 100); changed = True
                 elif key == ord('4'):
@@ -420,6 +460,7 @@ def main():
         print(f"    max_area        = {contour_params.max_area}")
         print(f"    min_circularity = {contour_params.min_circularity:.2f}")
         print(f"    max_circularity = {contour_params.max_circularity:.2f}")
+        print(f"\nRIM_THICKNESS_PX = {RIM_THICKNESS_PX}")
         print("-" * 70)
         print("Paste this into your next script to hard-code tuned parameters.")
         print("=" * 70 + "\n")
