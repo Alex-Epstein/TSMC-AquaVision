@@ -220,7 +220,7 @@ def main():
         print("Usage: python video_viewer.py <video_path>")
         sys.exit(1)
 
-    video_path = sys.argv[1]
+    video_path = "open-tap-middle-screen.mp4"
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
