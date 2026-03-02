@@ -2,6 +2,13 @@
 Real-Time Video Viewer — Steps 2–5
 ROI selection → MOG2 background subtraction → findContours →
 shape + intensity + rim-score features per detection
+
+Fixes applied:
+  - Background model trained only on earliest frames (droplet-free)
+  - Explicit learningRate=1.0 during training for fast, clean init
+  - learningRate=0 during detection (model fully frozen)
+  - varThreshold lowered to 10 for better foreground sensitivity
+  - history reduced to 200 to avoid over-fitting background
 """
 
 import cv2
@@ -32,6 +39,7 @@ RIM_THICKNESS_PX = 3   # ← tune: ~10-15% of smallest expected droplet diameter
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def circularity(area: float, perimeter: float) -> float:
     """4πA/P², clamped to [0, 1]."""
@@ -148,15 +156,19 @@ def create_info_bar(width, status, frame_count, total_frames, speed,
 
 # ── core detection + feature extraction ──────────────────────────────────────
 
+
 def process_frame_for_contours(frame, roi_params, back_sub,
-                                kernel_open, kernel_close,
-                                update_bg=True):
+                                kernel_open, kernel_close):
+    """
+    Always runs with learningRate=0 — the background model is frozen after
+    training and must never adapt to droplets/bubbles in the flow stream.
+    """
     roi_x, roi_y, roi_w, roi_h = roi_params
     cropped  = frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
     gray_roi = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
 
-    lr       = 0.001 if update_bg else 0
-    fg_raw   = back_sub.apply(cropped, learningRate=lr)
+    # ── FROZEN background model (lr=0 prevents droplet absorption) ────────
+    fg_raw = back_sub.apply(cropped, learningRate=0)
 
     _, fg_thresh = cv2.threshold(fg_raw, 127, 255, cv2.THRESH_BINARY)
     fg_opened    = cv2.morphologyEx(fg_thresh,  cv2.MORPH_OPEN,  kernel_open)
@@ -198,7 +210,7 @@ def process_frame_for_contours(frame, roi_params, back_sub,
         cv2.drawContours(vis, [d["contour"]], -1, cnt_color, 2)
         cv2.circle(vis, (d["cx"], d["cy"]), 4, (0, 0, 255), -1)
 
-        line1 = f"A={int(d['area_px'])}px2 c={d['circularity']:.2f}"   # ← CHANGED
+        line1 = f"A={int(d['area_px'])}px2 c={d['circularity']:.2f}"
         line2 = f"rim={d['rim_score']:+.1f} I={d['mean_intensity']:.0f}"
         cv2.putText(vis, line1,
                     (d["cx"] + 6, d["cy"] - 4),
@@ -210,7 +222,53 @@ def process_frame_for_contours(frame, roi_params, back_sub,
     return vis, detections
 
 
+def train_background_model(frame_history, roi_params):
+    """
+    Build a frozen background model from the EARLIEST available frames.
+
+    Strategy:
+      - Use the first min(30, N) frames — most likely to be droplet-free.
+      - Train with learningRate=1.0 so each frame contributes equally and
+        the model converges quickly on a clean background estimate.
+      - The model is NEVER updated after this point (learningRate=0 in
+        process_frame_for_contours), so droplets can never become background.
+
+    If fewer than 5 frames are available, falls back to all history with a
+    warning so the caller knows the baseline may already contain objects.
+    """
+    roi_x, roi_y, roi_w, roi_h = roi_params
+
+    # ── lower varThreshold = more sensitive foreground detection ──────────
+    # ── shorter history = model less entrenched in any one state ──────────
+    back_sub = cv2.createBackgroundSubtractorMOG2(
+        history=200, varThreshold=10, detectShadows=False
+    )
+
+    n_total    = len(frame_history)
+    train_end  = min(30, n_total)        # prefer earliest (cleanest) frames
+    train_set  = frame_history[:train_end]
+
+    if n_total < 5:
+        print(f"  WARNING: only {n_total} frame(s) in history — background "
+              "baseline may already contain droplets. Seek back to a clear "
+              "section of the video before selecting the ROI for best results.")
+    else:
+        print(f"  Using earliest {len(train_set)} of {n_total} buffered frames "
+              "(most likely droplet-free).")
+
+    for hf in train_set:
+        back_sub.apply(
+            hf[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w],
+            learningRate=1.0,   # fast, equal-weight init on clean frames
+        )
+
+    print(f"  Background model ready  "
+          f"(varThreshold=10, history=200, lr=0 during detection).")
+    return back_sub
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
+
 
 def main():
     global roi_selecting, roi_start, roi_end, roi_complete, roi_params
@@ -235,7 +293,9 @@ def main():
     print("Controls: SPACE=Pause | q=Quit | r=ROI | t=Tune | [/]=Zoom")
     print("          a/d=Step frames | +/-=Speed")
     print("=" * 70)
-    print("\n>>> Press 'r' then click-drag to select ROI <<<\n")
+    print("\n>>> Press 'r' then click-drag to select ROI <<<")
+    print("TIP: Seek to the START of the video before selecting ROI so the")
+    print("     background model trains on droplet-free frames.\n")
 
     paused           = True
     frame_count      = 0
@@ -265,8 +325,10 @@ def main():
                     frame_count   = 0
                     frame_history = []
                     if back_sub:
-                        back_sub = cv2.createBackgroundSubtractorMOG2(
-                            history=500, varThreshold=16, detectShadows=False)
+                        # Re-create so the frozen model resets on loop
+                        back_sub = None
+                        viewing_zoomed = False
+                        print("Video looped — re-select ROI to rebuild background model.")
                     continue
 
                 frame_count   = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
@@ -291,7 +353,6 @@ def main():
                     vis, detections = process_frame_for_contours(
                         current_frame, roi_params, back_sub,
                         kernel_open, kernel_close,
-                        update_bg=False,
                     )
                     contour_count = len(detections)
                     video_frame   = vis
@@ -337,14 +398,10 @@ def main():
 
                 cv2.imshow("Video Viewer", display_frame)
 
+            # ── build frozen background model once ROI is confirmed ───────
             if roi_complete and not viewing_zoomed and roi_params:
-                back_sub = cv2.createBackgroundSubtractorMOG2(
-                    history=500, varThreshold=20, detectShadows=False)
-
-                print("Training background model on recent frames...")
-                roi_x, roi_y, roi_w, roi_h = roi_params
-                for hf in frame_history[-100:]:
-                    back_sub.apply(hf[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w])
+                print("\nTraining background model on earliest buffered frames...")
+                back_sub = train_background_model(frame_history, roi_params)
 
                 viewing_zoomed = True
                 roi_complete   = False
@@ -391,7 +448,10 @@ def main():
                     roi_end        = None
                     roi_complete   = False
                     viewing_zoomed = False
+                    back_sub       = None   # discard old model on re-selection
                     print("\n>>> ROI SELECTION MODE — click and drag <<<")
+                    print("TIP: Seek to the START of the video (press 'a' repeatedly")
+                    print("     or use left arrow) so training uses clean frames.\n")
                 else:
                     print(">>> ROI selection cancelled <<<\n")
 
