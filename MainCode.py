@@ -2,18 +2,13 @@
 Real-Time Video Viewer — Steps 2–5
 ROI selection → MOG2 background subtraction → findContours →
 shape + intensity + rim-score features per detection
-
-Fixes applied:
-  - Background model trained only on earliest frames (droplet-free)
-  - Explicit learningRate=1.0 during training for fast, clean init
-  - learningRate=0 during detection (model fully frozen)
-  - varThreshold lowered to 10 for better foreground sensitivity
-  - history reduced to 200 to avoid over-fitting background
 """
+
 
 import cv2
 import sys
 import numpy as np
+
 
 
 roi_selecting   = False
@@ -23,6 +18,7 @@ roi_complete    = False
 roi_params      = None
 
 
+
 class ContourParams:
     min_area        = 50
     max_area        = 5000
@@ -30,12 +26,15 @@ class ContourParams:
     max_circularity = 1.0
 
 
+
 contour_params  = ContourParams()
 tuning_mode     = False
 display_zoom    = 2.0
 INFO_BAR_HEIGHT = 100
 
+
 RIM_THICKNESS_PX = 3   # ← tune: ~10-15% of smallest expected droplet diameter
+
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -48,20 +47,25 @@ def circularity(area: float, perimeter: float) -> float:
     return min(1.0, (4 * np.pi * area) / (perimeter ** 2))
 
 
+
 def compute_features(cnt, gray_roi: np.ndarray) -> dict:
     h, w = gray_roi.shape[:2]
+
 
     area  = cv2.contourArea(cnt)
     perim = cv2.arcLength(cnt, closed=True)
     circ  = circularity(area, perim)
     eq_d  = np.sqrt(4 * area / np.pi)
 
+
     mask_filled = np.zeros((h, w), dtype=np.uint8)
     cv2.drawContours(mask_filled, [cnt], -1, 255, thickness=cv2.FILLED)
+
 
     mean_val, std_val  = cv2.meanStdDev(gray_roi, mask=mask_filled)
     mean_intensity     = float(mean_val[0][0])
     std_intensity      = float(std_val[0][0])
+
 
     k = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
@@ -70,8 +74,10 @@ def compute_features(cnt, gray_roi: np.ndarray) -> dict:
     mask_interior = cv2.erode(mask_filled, k, iterations=1)
     mask_rim      = cv2.subtract(mask_filled, mask_interior)
 
+
     rim_pixels      = gray_roi[mask_rim      > 0]
     interior_pixels = gray_roi[mask_interior > 0]
+
 
     if rim_pixels.size > 0 and interior_pixels.size > 0:
         rim_mean      = float(rim_pixels.mean())
@@ -81,6 +87,7 @@ def compute_features(cnt, gray_roi: np.ndarray) -> dict:
         rim_mean      = mean_intensity
         interior_mean = mean_intensity
         rim_score     = 0.0
+
 
     return {
         "area_px":        area,
@@ -95,13 +102,17 @@ def compute_features(cnt, gray_roi: np.ndarray) -> dict:
     }
 
 
+
 def mouse_callback(event, x, y, flags, param):
     global roi_selecting, roi_start, roi_end, roi_complete, roi_params
+
 
     if not roi_selecting:
         return
 
+
     y_adj = y - INFO_BAR_HEIGHT
+
 
     if event == cv2.EVENT_LBUTTONDOWN:
         roi_start    = (x, y_adj)
@@ -109,8 +120,10 @@ def mouse_callback(event, x, y, flags, param):
         roi_complete = False
         print(f"ROI start: ({x}, {y_adj})")
 
+
     elif event == cv2.EVENT_MOUSEMOVE and roi_start is not None:
         roi_end = (x, y_adj)
+
 
     elif event == cv2.EVENT_LBUTTONUP:
         roi_end      = (x, y_adj)
@@ -118,8 +131,9 @@ def mouse_callback(event, x, y, flags, param):
         x1, y1 = roi_start
         x2, y2 = roi_end
         roi_params = (min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
-        print(f"\nROI COMPLETE: {roi_params[2]}x{roi_params[3]} at ({roi_params[0]}, {roi_params[1]})")
+        print(f"\\nROI COMPLETE: {roi_params[2]}x{roi_params[3]} at ({roi_params[0]}, {roi_params[1]})")
         print("Switching to contour detection mode...")
+
 
 
 def create_info_bar(width, status, frame_count, total_frames, speed,
@@ -127,6 +141,7 @@ def create_info_bar(width, status, frame_count, total_frames, speed,
     bar    = np.zeros((INFO_BAR_HEIGHT, width, 3), dtype=np.uint8)
     bar[:] = (40, 40, 40)
     cv2.line(bar, (0, 0), (width, 0), (100, 100, 100), 2)
+
 
     s_col = (0, 200, 0) if status == "PLAYING" else (0, 150, 255)
     cv2.putText(bar, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, s_col, 2)
@@ -137,6 +152,7 @@ def create_info_bar(width, status, frame_count, total_frames, speed,
     cv2.putText(bar, "+/- to change speed",
                 (250, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
 
+
     if contour_count is not None:
         cv2.putText(bar, f"Contours: {contour_count}",
                     (450, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
@@ -145,38 +161,42 @@ def create_info_bar(width, status, frame_count, total_frames, speed,
         cv2.putText(bar, f"Circ: {contour_params.min_circularity:.2f}-{contour_params.max_circularity:.2f}",
                     (450, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
+
     if zoom is not None and zoom != 1.0:
         cv2.putText(bar, f"Zoom: {zoom:.1f}x",
                     (width - 150, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
 
     cv2.line(bar, (0, INFO_BAR_HEIGHT - 1), (width, INFO_BAR_HEIGHT - 1),
              (100, 100, 100), 2)
     return bar
 
 
+
 # ── core detection + feature extraction ──────────────────────────────────────
 
 
 def process_frame_for_contours(frame, roi_params, back_sub,
-                                kernel_open, kernel_close):
-    """
-    Always runs with learningRate=0 — the background model is frozen after
-    training and must never adapt to droplets/bubbles in the flow stream.
-    """
+                                kernel_open, kernel_close,
+                                update_bg=True):
     roi_x, roi_y, roi_w, roi_h = roi_params
     cropped  = frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
     gray_roi = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
 
-    # ── FROZEN background model (lr=0 prevents droplet absorption) ────────
-    fg_raw = back_sub.apply(cropped, learningRate=0)
+
+    lr       = 0.001 if update_bg else 0
+    fg_raw   = back_sub.apply(cropped, learningRate=lr)
+
 
     _, fg_thresh = cv2.threshold(fg_raw, 127, 255, cv2.THRESH_BINARY)
     fg_opened    = cv2.morphologyEx(fg_thresh,  cv2.MORPH_OPEN,  kernel_open)
     fg_cleaned   = cv2.morphologyEx(fg_opened,  cv2.MORPH_CLOSE, kernel_close)
 
+
     contours, _ = cv2.findContours(
         fg_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
+
 
     detections = []
     for cnt in contours:
@@ -184,10 +204,12 @@ def process_frame_for_contours(frame, roi_params, back_sub,
         if not (contour_params.min_area <= area <= contour_params.max_area):
             continue
 
+
         perim = cv2.arcLength(cnt, closed=True)
         circ  = circularity(area, perim)
         if not (contour_params.min_circularity <= circ <= contour_params.max_circularity):
             continue
+
 
         M = cv2.moments(cnt)
         if M["m00"] == 0:
@@ -195,13 +217,16 @@ def process_frame_for_contours(frame, roi_params, back_sub,
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
+
         feats = compute_features(cnt, gray_roi)
+
 
         detections.append({
             "cx": cx, "cy": cy,
             "contour": cnt,
             **feats,
         })
+
 
     # ── draw overlay ──────────────────────────────────────────────────────
     vis = cropped.copy()
@@ -210,7 +235,8 @@ def process_frame_for_contours(frame, roi_params, back_sub,
         cv2.drawContours(vis, [d["contour"]], -1, cnt_color, 2)
         cv2.circle(vis, (d["cx"], d["cy"]), 4, (0, 0, 255), -1)
 
-        line1 = f"A={int(d['area_px'])}px2 c={d['circularity']:.2f}"
+
+        line1 = f"A={int(d['area_px'])}px2 c={d['circularity']:.2f}"   # ← CHANGED
         line2 = f"rim={d['rim_score']:+.1f} I={d['mean_intensity']:.0f}"
         cv2.putText(vis, line1,
                     (d["cx"] + 6, d["cy"] - 4),
@@ -219,52 +245,9 @@ def process_frame_for_contours(frame, roi_params, back_sub,
                     (d["cx"] + 6, d["cy"] + 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 255), 1)
 
+
     return vis, detections
 
-
-def train_background_model(frame_history, roi_params):
-    """
-    Build a frozen background model from the EARLIEST available frames.
-
-    Strategy:
-      - Use the first min(30, N) frames — most likely to be droplet-free.
-      - Train with learningRate=1.0 so each frame contributes equally and
-        the model converges quickly on a clean background estimate.
-      - The model is NEVER updated after this point (learningRate=0 in
-        process_frame_for_contours), so droplets can never become background.
-
-    If fewer than 5 frames are available, falls back to all history with a
-    warning so the caller knows the baseline may already contain objects.
-    """
-    roi_x, roi_y, roi_w, roi_h = roi_params
-
-    # ── lower varThreshold = more sensitive foreground detection ──────────
-    # ── shorter history = model less entrenched in any one state ──────────
-    back_sub = cv2.createBackgroundSubtractorMOG2(
-        history=200, varThreshold=10, detectShadows=False
-    )
-
-    n_total    = len(frame_history)
-    train_end  = min(30, n_total)        # prefer earliest (cleanest) frames
-    train_set  = frame_history[:train_end]
-
-    if n_total < 5:
-        print(f"  WARNING: only {n_total} frame(s) in history — background "
-              "baseline may already contain droplets. Seek back to a clear "
-              "section of the video before selecting the ROI for best results.")
-    else:
-        print(f"  Using earliest {len(train_set)} of {n_total} buffered frames "
-              "(most likely droplet-free).")
-
-    for hf in train_set:
-        back_sub.apply(
-            hf[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w],
-            learningRate=1.0,   # fast, equal-weight init on clean frames
-        )
-
-    print(f"  Background model ready  "
-          f"(varThreshold=10, history=200, lr=0 during detection).")
-    return back_sub
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -274,28 +257,32 @@ def main():
     global roi_selecting, roi_start, roi_end, roi_complete, roi_params
     global contour_params, tuning_mode, display_zoom
 
+
     if len(sys.argv) < 2:
         print("Usage: python video_viewer.py <video_path>")
         sys.exit(1)
 
+
     video_path = sys.argv[1]
     cap = cv2.VideoCapture(video_path)
+
 
     if not cap.isOpened():
         print(f"Error: Cannot open video: {video_path}")
         sys.exit(1)
 
+
     fps          = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
 
     print("=" * 70)
     print(f"Video: {video_path} | FPS: {fps:.2f} | Frames: {total_frames}")
     print("Controls: SPACE=Pause | q=Quit | r=ROI | t=Tune | [/]=Zoom")
     print("          a/d=Step frames | +/-=Speed")
     print("=" * 70)
-    print("\n>>> Press 'r' then click-drag to select ROI <<<")
-    print("TIP: Seek to the START of the video before selecting ROI so the")
-    print("     background model trains on droplet-free frames.\n")
+    print("\\n>>> Press 'r' then click-drag to select ROI <<<\\n")
+
 
     paused           = True
     frame_count      = 0
@@ -303,18 +290,23 @@ def main():
     viewing_zoomed   = False
     speed_multiplier = 1.0
 
+
     cv2.namedWindow("Video Viewer")
     cv2.setMouseCallback("Video Viewer", mouse_callback, video_path)
+
 
     current_frame = None
     back_sub      = None
 
+
     kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
 
     frame_history     = []
     left_arrow_codes  = [81, 2, 0]
     right_arrow_codes = [83, 3, 1]
+
 
     try:
         while True:
@@ -325,17 +317,17 @@ def main():
                     frame_count   = 0
                     frame_history = []
                     if back_sub:
-                        # Re-create so the frozen model resets on loop
-                        back_sub = None
-                        viewing_zoomed = False
-                        print("Video looped — re-select ROI to rebuild background model.")
+                        back_sub = cv2.createBackgroundSubtractorMOG2(
+                            history=500, varThreshold=16, detectShadows=False)
                     continue
+
 
                 frame_count   = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                 current_frame = frame.copy()
                 frame_history.append(frame.copy())
                 if len(frame_history) > 500:
                     frame_history.pop(0)
+
 
             else:
                 if current_frame is None:
@@ -346,16 +338,20 @@ def main():
                         if not frame_history:
                             frame_history.append(frame.copy())
 
+
             if current_frame is not None:
                 contour_count = None
+
 
                 if viewing_zoomed and roi_params and back_sub:
                     vis, detections = process_frame_for_contours(
                         current_frame, roi_params, back_sub,
                         kernel_open, kernel_close,
+                        update_bg=False,
                     )
                     contour_count = len(detections)
                     video_frame   = vis
+
 
                     if display_zoom != 1.0:
                         h, w = video_frame.shape[:2]
@@ -367,6 +363,7 @@ def main():
                 else:
                     video_frame = current_frame.copy()
 
+
                 h, w     = video_frame.shape[:2]
                 status   = "PAUSED" if paused else "PLAYING"
                 info_bar = create_info_bar(
@@ -375,6 +372,7 @@ def main():
                     zoom=display_zoom if viewing_zoomed else None,
                 )
                 display_frame = np.vstack([info_bar, video_frame])
+
 
                 if roi_selecting:
                     dh, dw = display_frame.shape[:2]
@@ -387,6 +385,7 @@ def main():
                                 (10, INFO_BAR_HEIGHT + 35),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
+
                     if roi_start and roi_end:
                         s = (roi_start[0], roi_start[1] + INFO_BAR_HEIGHT)
                         e = (roi_end[0],   roi_end[1]   + INFO_BAR_HEIGHT)
@@ -396,35 +395,49 @@ def main():
                                     (roi_start[0], roi_start[1] + INFO_BAR_HEIGHT - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
+
                 cv2.imshow("Video Viewer", display_frame)
 
-            # ── build frozen background model once ROI is confirmed ───────
+
             if roi_complete and not viewing_zoomed and roi_params:
-                print("\nTraining background model on earliest buffered frames...")
-                back_sub = train_background_model(frame_history, roi_params)
+                back_sub = cv2.createBackgroundSubtractorMOG2(
+                    history=500, varThreshold=20, detectShadows=False)
+
+
+                print("Training background model on recent frames...")
+                roi_x, roi_y, roi_w, roi_h = roi_params
+                for hf in frame_history[-100:]:
+                    back_sub.apply(hf[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w])
+
 
                 viewing_zoomed = True
                 roi_complete   = False
                 roi_selecting  = False
-                print("CONTOUR DETECTION ACTIVE\n")
+                print("CONTOUR DETECTION ACTIVE\\n")
+
 
             delay = max(1, int(1000 / fps / speed_multiplier)) if not paused else 1
             key   = cv2.waitKey(delay) & 0xFF
 
+
             if key == ord('q'):
                 break
+
 
             elif key == ord(' '):
                 paused = not paused
                 print(f"{'PAUSED' if paused else 'PLAYING'}")
 
+
             elif key == ord('+') or key == ord('='):
                 speed_multiplier = min(8.0, round(speed_multiplier + 0.25, 2))
                 print(f"Speed: {speed_multiplier:.2f}x")
 
+
             elif key == ord('-'):
                 speed_multiplier = max(0.05, round(speed_multiplier - 0.25, 2))
                 print(f"Speed: {speed_multiplier:.2f}x")
+
 
             elif key == ord('s') and current_frame is not None:
                 out = f"frame_{frame_count:06d}.png"
@@ -432,13 +445,16 @@ def main():
                 saved_count += 1
                 print(f"Saved: {out}")
 
+
             elif key == ord('['):
                 display_zoom = max(1.0, display_zoom - 0.5)
                 print(f"Zoom: {display_zoom:.1f}x")
 
+
             elif key == ord(']'):
                 display_zoom = min(8.0, display_zoom + 0.5)
                 print(f"Zoom: {display_zoom:.1f}x")
+
 
             elif key == ord('r'):
                 roi_selecting = not roi_selecting
@@ -448,12 +464,10 @@ def main():
                     roi_end        = None
                     roi_complete   = False
                     viewing_zoomed = False
-                    back_sub       = None   # discard old model on re-selection
-                    print("\n>>> ROI SELECTION MODE — click and drag <<<")
-                    print("TIP: Seek to the START of the video (press 'a' repeatedly")
-                    print("     or use left arrow) so training uses clean frames.\n")
+                    print("\\n>>> ROI SELECTION MODE — click and drag <<<")
                 else:
-                    print(">>> ROI selection cancelled <<<\n")
+                    print(">>> ROI selection cancelled <<<\\n")
+
 
             elif (key == ord('a') or key in left_arrow_codes) and paused:
                 new_pos = max(0, frame_count - 2)
@@ -464,6 +478,7 @@ def main():
                     frame_count   = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                     print(f"← Frame: {frame_count}/{total_frames}")
 
+
             elif (key == ord('d') or key in right_arrow_codes) and paused:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count)
                 ret, frame = cap.read()
@@ -472,16 +487,18 @@ def main():
                     frame_count   = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                     print(f"→ Frame: {frame_count}/{total_frames}")
 
+
             elif key == ord('t'):
                 tuning_mode = not tuning_mode
                 if tuning_mode:
-                    print("\n" + "=" * 70)
+                    print("\\n" + "=" * 70)
                     print("TUNING MODE  —  1/2=MinArea  3/4=MaxArea  5/6=MinCirc  t=Exit")
                     print(f"Current: area {contour_params.min_area}-{contour_params.max_area} | "
                           f"circ {contour_params.min_circularity:.2f}-{contour_params.max_circularity:.2f}")
                     print("=" * 70)
                 else:
-                    print(">>> TUNING MODE EXITED <<<\n")
+                    print(">>> TUNING MODE EXITED <<<\\n")
+
 
             elif tuning_mode:
                 changed = False
@@ -498,32 +515,37 @@ def main():
                 elif key == ord('6'):
                     contour_params.min_circularity = min(1.0, contour_params.min_circularity + 0.05); changed = True
 
+
                 if changed:
                     print(f"Params: area {contour_params.min_area}-{contour_params.max_area} | "
                           f"circ {contour_params.min_circularity:.2f}")
 
+
             elif key != 255 and paused:
                 print(f"Unrecognized key: {key}")
+
 
     finally:
         cap.release()
         cv2.destroyAllWindows()
 
-        print("\n" + "=" * 70)
+
+        print("\\n" + "=" * 70)
         print("SESSION COMPLETE")
         print("=" * 70)
         print(f"Frames analyzed: {frame_count}/{total_frames} | Saved: {saved_count}")
-        print("\nFINAL CONTOUR DETECTION PARAMETERS:")
+        print("\\nFINAL CONTOUR DETECTION PARAMETERS:")
         print("-" * 70)
         print(f"class ContourParams:")
         print(f"    min_area        = {contour_params.min_area}")
         print(f"    max_area        = {contour_params.max_area}")
         print(f"    min_circularity = {contour_params.min_circularity:.2f}")
         print(f"    max_circularity = {contour_params.max_circularity:.2f}")
-        print(f"\nRIM_THICKNESS_PX = {RIM_THICKNESS_PX}")
+        print(f"\\nRIM_THICKNESS_PX = {RIM_THICKNESS_PX}")
         print("-" * 70)
         print("Paste this into your next script to hard-code tuned parameters.")
-        print("=" * 70 + "\n")
+        print("=" * 70 + "\\n")
+
 
 
 if __name__ == "__main__":
