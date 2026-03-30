@@ -147,7 +147,8 @@ class Track:
 
     def averaged_features(self) -> dict:
         keys = self.snapshots[0].keys()
-        return {k: float(np.mean([s[k] for s in self.snapshots])) for k in keys}
+        return {k: float(np.mean([s[k] for s in self.snapshots])) 
+            for k in keys if k != 'contour'}
 
     @property
     def lifespan(self):
